@@ -216,6 +216,7 @@ function Send-Raw([byte[]]$Data) {
 # ---------------- main ----------------
 $fileName = [System.IO.Path]::GetFileName($job.file)
 Log "START" "---- $fileName -> $($job.method) $($job.host):$($job.port) queue=$($job.queue) ----"
+Log "ENV" "script=$PSCommandPath jobFile=$JobFile PowerShell=$($PSVersionTable.PSVersion) user=$env:USERDOMAIN\$env:USERNAME policy=$(Get-ExecutionPolicy)"
 Log "JOB" "name='$($job.jobName)' copies=$($job.copies) test=$($job.testPrint) media='$($job.media)' finishing='$($job.finishing)' customer='$($job.customerName)' instructions='$($job.instructions)'"
 
 if (-not (Test-Path -LiteralPath $job.file)) { Finish $false "File not found: $($job.file)" }

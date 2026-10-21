@@ -4,11 +4,15 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
 import java.util.logging.Level;
 import java.util.logging.Logger;
+import java.util.stream.Collectors;
 
 /**
  * Sends one file to the Fiery by running Send-ToFieryHold.ps1. The job settings are handed over in a
@@ -28,45 +32,92 @@ public final class FierySender {
     }
 
     public Result send(PrintJob job) {
+        if (!Files.isRegularFile(cfg.sendScript())) {
+            String msg = "Send script not found: " + cfg.sendScript() + " (check send.script in " + cfg.configFile() + ")";
+            LOG.severe(msg);
+            return new Result(false, msg);
+        }
         Path jobFile = null;
         Path outFile = null;
+        Result result = null;
         try {
             jobFile = Files.createTempFile("fiery-job-", ".json");
             outFile = Files.createTempFile("fiery-job-", ".out");
-            Files.writeString(jobFile, toJson(job), StandardCharsets.UTF_8);
+            String json = toJson(job);
+            Files.writeString(jobFile, json, StandardCharsets.UTF_8);
 
-            ProcessBuilder pb = new ProcessBuilder(
+            List<String> command = List.of(
                     cfg.powershellExe(), "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
                     "-WindowStyle", "Hidden", "-File", cfg.sendScript().toString(), "-JobFile", jobFile.toString());
+            LOG.info("Executing PowerShell for " + job.fileName() + ":\n  " + commandLine(command)
+                    + "\n  Job file " + jobFile + ":\n" + json.indent(4).stripTrailing());
+
+            ProcessBuilder pb = new ProcessBuilder(command);
             pb.redirectErrorStream(true);
             pb.redirectOutput(outFile.toFile());
+            long start = System.nanoTime();
             Process process = pb.start();
 
-            if (!process.waitFor(cfg.sendTimeoutSeconds(), TimeUnit.SECONDS)) {
-                process.destroyForcibly();
-                return new Result(false, "Timed out after " + cfg.sendTimeoutSeconds() + " s");
-            }
-            String output = Files.readString(outFile, StandardCharsets.UTF_8);
-            LOG.fine(() -> "Script output for " + job.fileName() + ":\n" + output);
+            boolean finished = process.waitFor(cfg.sendTimeoutSeconds(), TimeUnit.SECONDS);
+            if (!finished) process.destroyForcibly().waitFor(5, TimeUnit.SECONDS);
+            long millis = (System.nanoTime() - start) / 1_000_000;
+            String output = readOutput(outFile);
+            String exit = finished ? Integer.toString(process.exitValue()) : "killed (timeout)";
+            LOG.info("PowerShell finished for " + job.fileName() + ": exit=" + exit + ", " + millis + " ms, output:\n"
+                    + (output.isBlank() ? "    <no output>" : output.indent(4).stripTrailing()));
 
+            if (!finished) {
+                return result = new Result(false, "Timed out after " + cfg.sendTimeoutSeconds() + " s");
+            }
             String resultLine = output.lines().filter(l -> l.startsWith("RESULT|")).reduce((a, b) -> b).orElse(null);
             if (resultLine == null) {
+                // Script never reached its end: usually PowerShell itself failed (blocked script, syntax error, ...)
                 String tail = output.lines().filter(l -> !l.isBlank()).reduce((a, b) -> b).orElse("no output");
-                return new Result(false, "Script exit " + process.exitValue() + ": " + tail);
+                return result = new Result(false, "Script exit " + exit + ": " + tail);
             }
             String[] parts = resultLine.split("\\|", 3);
             boolean ok = "OK".equals(parts[1]) && process.exitValue() == 0;
-            return new Result(ok, parts.length > 2 ? parts[2] : "");
+            return result = new Result(ok, parts.length > 2 ? parts[2] : "");
         } catch (IOException e) {
-            LOG.log(Level.WARNING, "Could not run send script", e);
-            return new Result(false, "Could not run PowerShell: " + e.getMessage());
+            LOG.log(Level.WARNING, "Could not run PowerShell (" + cfg.powershellExe()
+                    + ") - check powershell.exe in " + cfg.configFile(), e);
+            return result = new Result(false, "Could not run PowerShell: " + e.getMessage());
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
-            return new Result(false, "Interrupted");
+            return result = new Result(false, "Interrupted");
         } finally {
+            if (result != null && !result.ok()) keepForRerun(job, jobFile);
             deleteQuietly(jobFile);
             deleteQuietly(outFile);
         }
+    }
+
+    /** Copies a failed job's JSON to logs/failed-jobs and logs a command that reruns it by hand. */
+    private void keepForRerun(PrintJob job, Path jobFile) {
+        if (jobFile == null || !Files.exists(jobFile)) return;
+        try {
+            Path dir = Files.createDirectories(cfg.logFolder().resolve("failed-jobs"));
+            String stamp = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss"));
+            Path kept = dir.resolve(stamp + "_" + job.fileName().replaceAll("[^A-Za-z0-9._-]", "_") + ".json");
+            Files.copy(jobFile, kept, StandardCopyOption.REPLACE_EXISTING);
+            LOG.warning("Failed job saved. Rerun it in a PowerShell window to see the full error:\n  "
+                    + commandLine(List.of(cfg.powershellExe(), "-NoProfile", "-ExecutionPolicy", "Bypass",
+                    "-File", cfg.sendScript().toString(), "-JobFile", kept.toString())));
+        } catch (IOException e) {
+            LOG.warning("Could not save failed job file: " + e);
+        }
+    }
+
+    /** Command as it would be typed in cmd / PowerShell, arguments with spaces quoted. */
+    private static String commandLine(List<String> command) {
+        return command.stream()
+                .map(a -> a.isEmpty() || a.contains(" ") ? '"' + a + '"' : a)
+                .collect(Collectors.joining(" "));
+    }
+
+    /** PowerShell may write in the console code page; decode leniently instead of failing on bad UTF-8. */
+    private static String readOutput(Path outFile) throws IOException {
+        return new String(Files.readAllBytes(outFile), StandardCharsets.UTF_8);
     }
 
     /** Job name as it appears in the Fiery Hold queue. */
